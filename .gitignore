@@ -1,0 +1,41 @@
+# Python
+
+venv/
+**pycache**/
+*.pyc
+
+# PyCharm
+
+.idea/
+
+# Audio Files
+
+*.mp3
+*.flac
+*.wav
+*.ogg
+*.m4a
+
+# Spectrograms
+
+*.png
+
+# Generated Data
+
+QC_Output/
+Good/
+Corrupted/
+
+# CSV Reports
+
+data/*.csv
+
+# Windows
+
+Thumbs.db
+desktop.ini
+
+# Weitere
+
+QC_Input/
+Find_Better_Quality/
