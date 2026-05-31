@@ -37,7 +37,3 @@ output/trash/*
 
 output/spectrograms/*
 !output/spectrograms/.gitkeep
-
-# --- Legacy Archive & Backup Repositories ---
-# (Keeps your clean repository free from clutter, backups and alternative script drafts)
-archive/
