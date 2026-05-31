@@ -1,41 +1,43 @@
-# Python
+# ==============================================================================
+# BatchQC - Target Git Ignore Configuration
+# ==============================================================================
 
-venv/
-**pycache**/
+# --- Python Environment & Runtime Artifacts ---
+.venv/
+__pycache__/
 *.pyc
-
-# PyCharm
-
+*.pyo
+*.pyd
+.pytest_cache/
+.vscode/
 .idea/
 
-# Audio Files
+# --- Local Databases (User Configurations & Curation Registries) ---
+database/*.db
+!database/.gitkeep
 
-*.mp3
-*.flac
-*.wav
-*.ogg
-*.m4a
+# --- Runtime Data Directories (Audio Assets & Diagnostic Visuals) ---
+input/*
+!input/.gitkeep
 
-# Spectrograms
+output/corrupted/*
+!output/corrupted/.gitkeep
 
-*.png
+output/good-quality/*
+!output/good-quality/.gitkeep
 
-# Generated Data
+output/good-quality-formatted/*
+!output/good-quality-formatted/.gitkeep
 
-QC_Output/
-Good/
-Corrupted/
+output/low-quality/*
+!output/low-quality/.gitkeep
 
-# CSV Reports
+output/trash/*
+!output/trash/.gitkeep
 
-data/*.csv
+output/spectrograms/*
+!output/spectrograms/.gitkeep
 
-# Windows
-
-Thumbs.db
-desktop.ini
-
-# Weitere
-
-QC_Input/
-Find_Better_Quality/
+# --- Legacy Archive & Backup Repositories ---
+# (Keeps your clean repository free from clutter, backups and alternative script drafts)
+archive/

@@ -1,14 +1,15 @@
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 # --- PFADE ---
 # Stelle sicher, dass ffmpeg.exe im Projektordner liegt
 FFMPEG_EXE = r"C:\Program Files\FFmpeg\ffmpeg-2025-12-22-git-c50e5c7778-essentials_build\bin\ffmpeg.exe"
 
-PROJECT_FOLDER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCE_FOLDER = os.path.join(PROJECT_FOLDER, "Good")
-TARGET_FOLDER = os.path.join(PROJECT_FOLDER, "Good Transformed")
+PROJECT_FOLDER = Path(__file__).resolve().parent.parent
+SOURCE_FOLDER = PROJECT_FOLDER / "output" / "good-quality"
+TARGET_FOLDER = PROJECT_FOLDER / "output" / "good-quality-formatted"
 
 def transform_audio():
     os.makedirs(TARGET_FOLDER, exist_ok=True)
