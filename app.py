@@ -22,7 +22,7 @@ import shutil
 from datetime import date, datetime
 from pathlib import Path
 from collections import deque
-from flask import Flask, render_template, request, redirect, url_for, send_from_directory, jsonify, flash
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, jsonify, flash, session
 
 app = Flask(__name__)
 # Required for flash messages and session state signature verification
@@ -66,10 +66,7 @@ class WebConfig:
 # System fallback configurations including ergonomic default hotkeys
 DEFAULT_PREFERENCES = {
     "bitrate_threshold": 160,
-    "action_trash": False,
-    "action_wishlist": False,
-    "action_low_quality": False,
-    # Ergonomic primary keys mapping for single-handed workflow acceleration
+    "auto_action_mode": "none",  # New unified dropdown system
     "hk_ok": "1",
     "hk_trash_wishlist": "2",
     "hk_trash_only": "3",
@@ -129,7 +126,7 @@ class PreferencesService:
                     prefs[key] = int(val)
                 elif key in ["action_trash", "action_wishlist", "action_low_quality"]:
                     prefs[key] = val == "True"
-                elif key.startswith("hk_"):
+                elif key.startswith("hk_") or key == "auto_action_mode":
                     prefs[key] = str(val)
         return prefs
 
@@ -230,7 +227,7 @@ class DatabaseService:
                     Timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            # Table B: Wishlist tracking data system repository (Moved here from wishlist.db)
+            # Table B: Wishlist tracking data system repository
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS wishlist (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,20 +242,34 @@ class DatabaseService:
             conn.commit()
 
     @classmethod
-    def fetch_pending_tracks(cls):
-        """Queries and returns unverified track data rows waiting for appraisal selection."""
+    def fetch_pending_tracks(cls, excluded_ids=None):
+        """
+        Queries and returns unverified track data rows waiting for appraisal selection.
+        Allows programmatic exclusion of specific IDs (e.g., skipped items in session).
+        """
         cls.initialize_schemas()
         if not WebConfig.DB_FILE.exists():
             return []
 
+        if excluded_ids is None:
+            excluded_ids = []
+
         with cls._get_connection() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT * FROM qc_report "
-                "WHERE Status IS NULL OR Status = '' OR Status = 'Skipped' "
-                "ORDER BY id ASC"
-            )
+
+            # Base query fetches assets that have no definitive curation decision yet
+            base_query = "SELECT * FROM qc_report WHERE (Status IS NULL OR Status = '' OR Status = 'Skipped')"
+
+            # Dynamically expand the query if certain IDs are currently skipped in this session
+            if excluded_ids:
+                placeholders = ', '.join(['?'] * len(excluded_ids))
+                full_query = f"{base_query} AND id NOT IN ({placeholders}) ORDER BY id ASC"
+                cursor.execute(full_query, tuple(excluded_ids))
+            else:
+                full_query = f"{base_query} ORDER BY id ASC"
+                cursor.execute(full_query)
+
             return [dict(row) for row in cursor.fetchall()]
 
     @classmethod
@@ -370,8 +381,19 @@ def run_transform_worker():
 @app.route('/')
 def index():
     """Renders the core curation queue interface."""
-    pending_tracks = DatabaseService.fetch_pending_tracks()
+    # Retrieve the list of session-skipped track IDs from client state cookies
+    skipped_ids = session.get('skipped_tracks', [])
+
+    # Query pending tracks while filtering out the session-skipped list
+    pending_tracks = DatabaseService.fetch_pending_tracks(excluded_ids=skipped_ids)
     remaining_count = len(pending_tracks)
+
+    # Automatic fallback: If queue is empty but user skipped tracks previously,
+    # reset the session skip-list to recycled evaluation state seamlessly.
+    if remaining_count == 0 and skipped_ids:
+        session.pop('skipped_tracks', None)
+        pending_tracks = DatabaseService.fetch_pending_tracks()
+        remaining_count = len(pending_tracks)
 
     current_track = pending_tracks[0] if remaining_count > 0 else None
     spectrum_file = None
@@ -440,9 +462,19 @@ def action():
             flash(f"Downgraded: '{filename}' moved to Low-Quality archive.", "success")
 
         elif action_type == "skip":
+            # Append track ID to session exclusion runtime list vector
+            if 'skipped_tracks' not in session:
+                session['skipped_tracks'] = []
+
+            # Create explicit list primitive type to force Flask state persistence tracking
+            current_skips = list(session['skipped_tracks'])
+            if track_id not in current_skips:
+                current_skips.append(track_id)
+                session['skipped_tracks'] = current_skips
+
             ActionHistory.push("skip", track_id, music_path)
             DatabaseService.update_track_status(track_id, "Skipped")
-            flash(f"Skipped track: '{filename}'", "success")
+            flash(f"Skipped track: '{filename}'", "warning")
 
         else:
             flash(f"Unknown curation type code configuration: '{action_type}'", "danger")
@@ -462,9 +494,17 @@ def undo():
         flash("No operational actions available inside rollback memory buffer.", "warning")
         return redirect(url_for('index'))
 
+    # If the action was a physical file movement, return it safely to its source path
     if last_action['type'] in ['ok', 'trash_wishlist', 'trash_only', 'low_quality']:
         if os.path.exists(last_action['dst']):
             shutil.move(last_action['dst'], last_action['src'])
+
+    # If rolling back a skip action, pull the item out of the session-skipped tracking vector
+    elif last_action['type'] == 'skip':
+        current_skips = session.get('skipped_tracks', [])
+        if last_action['id'] in current_skips:
+            current_skips.remove(last_action['id'])
+            session['skipped_tracks'] = current_skips
 
     DatabaseService.update_track_status(last_action['id'], None)
     flash("Last curation step successfully rolled back.", "success")
@@ -539,11 +579,9 @@ def preferences_save():
     """Parses payload configuration updates and generic hotkey binds from modal."""
     updated_prefs = {
         "bitrate_threshold": int(request.form.get("bitrate_threshold", DEFAULT_PREFERENCES["bitrate_threshold"])),
-        "action_trash": "action_trash" in request.form,
-        "action_wishlist": "action_wishlist" in request.form,
-        "action_low_quality": "action_low_quality" in request.form,
+        "auto_action_mode": request.form.get("auto_action_mode", DEFAULT_PREFERENCES["auto_action_mode"]),
 
-        # Generic hotkey processing extraction layer. Sanitized to absolute lowercase entries.
+        # Generic hotkey processing extraction layer.
         "hk_ok": request.form.get("hk_ok", DEFAULT_PREFERENCES["hk_ok"]).strip().lower()[:1],
         "hk_trash_wishlist": request.form.get("hk_trash_wishlist",
                                               DEFAULT_PREFERENCES["hk_trash_wishlist"]).strip().lower()[:1],

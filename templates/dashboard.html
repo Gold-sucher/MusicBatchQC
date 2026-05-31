@@ -377,6 +377,19 @@
     .input-row input[type="number"]:focus { border-color: #0d6efd; }
     .input-unit { font-size: 0.85rem; color: #6c757d; }
 
+    .select-dropdown {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ced4da;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      background: #ffffff;
+      outline: none;
+      color: #212529;
+      transition: border-color 0.15s;
+    }
+    .select-dropdown:focus { border-color: #0d6efd; }
+
     /* Generic Hotkey Grid Layout Styles */
     .hotkey-grid {
       display: grid;
@@ -531,14 +544,26 @@
 
         <div class="modal-body">
           <div class="pref-section">
-            <div class="pref-section-title">Automated Analysis Rules</div>
+            <div class="pref-section-title">Automated Ingestion Rules</div>
+
             <div class="pref-field">
               <label class="pref-label">Quality Baseline Bitrate</label>
-              <div class="pref-hint">Tracks falling below this boundary level will trigger targeted automation presets during the ingestion lifecycle.</div>
+              <div class="pref-hint">Tracks falling below this boundary level will trigger targeted automation presets.</div>
               <div class="input-row">
                 <input type="number" name="bitrate_threshold" value="{{ prefs.bitrate_threshold }}" min="64" max="320" required>
                 <span class="input-unit">kbps</span>
               </div>
+            </div>
+
+            <div class="pref-field" style="margin-top: 16px;">
+              <label class="pref-label">Unified Action Target</label>
+              <div class="pref-hint">Select what happens automatically if a track has a low bitrate OR does not cross above the visual guide line (19kHz).</div>
+              <select name="auto_action_mode" class="select-dropdown">
+                <option value="none" {% if prefs.auto_action_mode == 'none' %}selected{% endif %}>Disabled (Manual Review Only)</option>
+                <option value="low_quality_wishlist" {% if prefs.auto_action_mode == 'low_quality_wishlist' %}selected{% endif %}>Move to Low-Quality & Add to Wishlist</option>
+                <option value="trash_wishlist" {% if prefs.auto_action_mode == 'trash_wishlist' %}selected{% endif %}>Move to Trash & Add to Wishlist</option>
+                <option value="trash_only" {% if prefs.auto_action_mode == 'trash_only' %}selected{% endif %}>Move to Trash Directly (No Wishlist)</option>
+              </select>
             </div>
           </div>
 

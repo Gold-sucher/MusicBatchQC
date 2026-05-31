@@ -6,11 +6,11 @@ Description:
 Audio file analysis tool for quality control and metadata collection.
 - Detects corrupted files.
 - Generates high-resolution spectrograms.
+- Analyzes spectrogram images programmatically for frequency cutoffs.
 - Extracts technical metadata and audio tags via FFmpeg.
 - Fallback: Fetches missing genres via MusicBrainz API.
 - Automatically writes fetched/missing tags back INTO the actual audio files.
-- Applies configurable bitrate-based auto-actions (Trash / Wishlist / Low-Quality)
-  by reading the user's saved Preferences from the Flask app's API.
+- Applies unified automation rules based on user Preferences from the Flask API.
 - Stores all reports in a local structured SQLite database.
 
 Project Directory Structure (BatchQC):
@@ -29,6 +29,10 @@ import urllib.parse
 from datetime import date
 from pathlib import Path
 
+# External library required for programmatic image analysis
+# Install via: pip install Pillow
+from PIL import Image
+
 
 # ==============================================================================
 # 1. CENTRAL SCRIPT CONFIGURATION (Aligned with Directory Structure)
@@ -38,36 +42,22 @@ class Config:
     Holds all global paths, folder configurations, and application constants.
     Centralizing this makes it easy to maintain or expand the project later.
     """
-    # Dynamically locates the "BatchQC" root directory.
-    # Since this script resides in "BatchQC/scripts/", .parent.parent goes 2 levels up.
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-    # Source directory tracking incoming unverified audio files
     INPUT_FOLDER = PROJECT_ROOT / "input"
-
-    # Core output container directory
     OUTPUT_BASE = PROJECT_ROOT / "output"
 
-    # Sub-directories mapped inside the core output directory pool
-    CORRUPTED_FOLDER    = OUTPUT_BASE / "corrupted"
+    CORRUPTED_FOLDER = OUTPUT_BASE / "corrupted"
     SPECTROGRAMS_FOLDER = OUTPUT_BASE / "spectrograms"
-    TRASH_FOLDER        = OUTPUT_BASE / "trash"
-    LOW_QUALITY_FOLDER  = OUTPUT_BASE / "low-quality"
+    TRASH_FOLDER = OUTPUT_BASE / "trash"
+    LOW_QUALITY_FOLDER = OUTPUT_BASE / "low-quality"
+    GOOD_FOLDER = OUTPUT_BASE / "good-quality"
 
-    # Persistence relational reporting database parameters
     DATABASE_FOLDER = PROJECT_ROOT / "database"
-    DB_FILE         = DATABASE_FOLDER / "track-repository.db"
-    WISHLIST_DB     = DATABASE_FOLDER / "wishlist.db"
+    DB_FILE = DATABASE_FOLDER / "track-repository.db"
 
-    # Flask app base URL — used to fetch Preferences at runtime
-    # Change this if the app runs on a different host/port.
     FLASK_BASE_URL = "http://127.0.0.1:5000"
-
-    # Supported file extensions for automated batch processing cycles
     SUPPORTED_EXTENSIONS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".mp4", ".aif", ".aiff"}
-
-    # Required User-Agent identification identifier for the MusicBrainz API queries
-    USER_AGENT = 'BatchQCAudioAnalyzer/3.0 (contact-via-github-or-email)'
+    USER_AGENT = 'BatchQCAudioAnalyzer/4.0 (contact-via-github-or-email)'
 
 
 # ==============================================================================
@@ -77,36 +67,18 @@ class DatabaseManager:
     """
     Manages all SQLite database connections, schema definitions, and queries
     for both Quality Control reports and the Wishlist repository.
-
-    This unified approach encapsulates operations into a single database file
-    while organizing data logically across distinct, specialized tables.
     """
 
     def __init__(self, db_path: Path):
-        """
-        Initializes the database manager with a target persistence file path.
-        Automatically triggers schema verification and table creation routines.
-        """
         self.db_path = db_path
         self._initialize_database_schema()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """
-        Creates and returns a fresh isolated SQLite connection context.
-        Enforces foreign key constraints if expanded in future updates.
-        """
         return sqlite3.connect(self.db_path)
 
     def _initialize_database_schema(self):
-        """
-        Executes internal database DDL routines to safely establish necessary
-        tables if they do not already exist within the storage engine.
-        """
-        # Ensure the parent directory structure physically exists
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
         with self._get_connection() as conn:
-            # Table 1: Core Quality Control track analysis tracking registry
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS qc_report (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,9 +96,6 @@ class DatabaseManager:
                     Timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-
-            # Table 2: Curation target wishlist repository (Unified into the same DB)
-            # UNIQUE constraint prevents duplicate track configurations
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS wishlist (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,24 +109,14 @@ class DatabaseManager:
             ''')
             conn.commit()
 
-    # --- QC_REPORT TABLE METHODS ---
-
     def get_processed_file_paths(self) -> set:
-        """
-        Queries and compiles a lookup set of all previously analyzed files
-        to efficiently skip duplicate ingestion pipelines.
-        """
         query_string = "SELECT FilePath FROM qc_report"
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query_string)
-            # Returns a set structure for optimized O(1) compliance checks
             return {row[0] for row in cursor.fetchall()}
 
     def insert_qc_track(self, track_metadata: dict):
-        """
-        Persists a newly audited audio file tracking entry into the qc_report table.
-        """
         insert_query = '''
             INSERT INTO qc_report (
                 FileName, FilePath, Artist, Title, Genre,
@@ -180,13 +139,7 @@ class DatabaseManager:
             ))
             conn.commit()
 
-    # --- WISHLIST TABLE METHODS ---
-
     def insert_wishlist_track(self, track_metadata: dict):
-        """
-        Safely inserts a track into the wishlist table repository.
-        Uses INSERT OR IGNORE to automatically bypass duplicate entities.
-        """
         insert_query = '''
             INSERT OR IGNORE INTO wishlist (Artist, Title, Genre, FileName, DateAdded)
             VALUES (?, ?, ?, ?, ?)
@@ -208,28 +161,14 @@ class DatabaseManager:
 class PreferencesLoader:
     """
     Fetches the user's saved Preferences from the running Flask app's JSON API.
-    Falls back to safe defaults if the Flask app is not reachable (e.g. standalone runs).
-
-    Why fetch from Flask instead of reading the DB directly?
-    - Single source of truth: Preferences logic (defaults, validation) lives in app.py.
-    - This script stays decoupled from Flask internals.
     """
-
-    # These mirrors DEFAULT_PREFERENCES in app.py.
-    # Update both places if you add new preference keys.
     FALLBACK = {
-        "bitrate_threshold":  128,
-        "action_trash":       False,
-        "action_wishlist":    False,
-        "action_low_quality": False,
+        "bitrate_threshold": 160,
+        "auto_action_mode": "none"  # Options: "none", "low_quality_wishlist", "trash_wishlist", "trash_only"
     }
 
     @classmethod
     def load(cls) -> dict:
-        """
-        Attempts to GET preferences from the Flask API endpoint.
-        Returns the fallback defaults if the request fails.
-        """
         url = f"{Config.FLASK_BASE_URL}/api/preferences"
         try:
             req = urllib.request.Request(url)
@@ -243,19 +182,65 @@ class PreferencesLoader:
 
 
 # ==============================================================================
-# 4. BITRATE ACTION HANDLER
+# 4. AUDIO SPECTRUM ANALYZER (Programmatic Image Scan Engine)
 # ==============================================================================
-class BitrateActionHandler:
+class AudioSpectrumAnalyzer:
     """
-    Evaluates tracks against quality criteria constraints and routes files
-    or tracking entry updates based on user preferences.
+    Analyzes generated spectrogram images to determine the frequency presence
+    and energy density above a specific vertical threshold (the 19kHz green line).
+    """
+
+    @classmethod
+    def check_high_frequency_density(cls, image_path: Path, cutoff_percentage: float = 13.8) -> float:
+        """
+        Scans the upper band of a NAKED spectrogram image (no legends/gridlines)
+        to calculate the percentage of the track's duration containing high frequencies.
+        """
+        if not image_path.exists():
+            return 1.0
+
+        try:
+            with Image.open(image_path) as img:
+                rgb_img = img.convert("RGB")
+                width, height = rgb_img.size
+
+                # Calculate the exact pixel row for 19kHz in a 22.05kHz spectrum without legends
+                max_y_pixel = int(height * (cutoff_percentage / 100.0))
+
+                active_columns_count = 0
+
+                # Scan the entire width since there are no borders anymore
+                for x in range(0, width):
+                    # Scan from the very top (Y=0) down to the 19kHz mark
+                    for y in range(0, max_y_pixel):
+                        r, g, b = rgb_img.getpixel((x, y))
+
+                        # Strict color threshold: Pure black/dark blue background in FFmpeg is very low.
+                        # Real audio signal lights up brightly.
+                        if r > 40 or g > 40 or b > 40:
+                            active_columns_count += 1
+                            break  # Energy confirmed, move to next X column
+
+                density_ratio = (active_columns_count / width) * 100.0
+                print(f"   -> [SpectrumScan] Dynamic High-Frequency Density calculated: {density_ratio:.2f}%")
+                return density_ratio
+
+        except Exception as e:
+            print(f"   -> [SpectrumScan-Error] Failed to process image matrix array: {e}")
+            return 1.0
+
+
+# ==============================================================================
+# 5. AUTOMATED PIPELINE ACTION HANDLER
+# ==============================================================================
+class AutomatedActionHandler:
+    """
+    Executes automated routing and wishlist logging based on unified workflow rules.
+    Optimized to minimize processor workload by chaining criteria execution sequence.
     """
 
     @staticmethod
     def _move_file_to_destination(source_path: str, destination_folder: Path) -> str:
-        """
-        Moves a file to a specific destination folder. Creates directories if needed.
-        """
         destination_folder.mkdir(parents=True, exist_ok=True)
         target_path = str(destination_folder / os.path.basename(source_path))
         if os.path.exists(source_path):
@@ -263,205 +248,173 @@ class BitrateActionHandler:
         return target_path
 
     @classmethod
-    def apply(cls, track: dict, prefs: dict, db_manager: DatabaseManager) -> str | None:
+    def process_rules(cls, track: dict, prefs: dict, db_manager: DatabaseManager) -> str | None:
         """
-        Processes bitrate checks and executes requested automated lifecycle actions.
+        Executes automated quality control criteria check:
+        - If bitrate is lower than threshold, trigger system preferences auto-action.
+        - Calculate high-frequency density above 19kHz line.
+        - If density >= 50.0%, automatically approve and route to 'good-quality'.
+        - If density == 0.0%, trigger system preferences auto-action.
+        - Otherwise (0.0% < density < 50.0%), leave Status as NULL for cautious manual inspection.
         """
-        threshold = int(prefs.get("bitrate_threshold", 128))
-        bitrate   = int(track.get("Bitrate_kbps") or 0)
+        threshold_bitrate = int(prefs.get("bitrate_threshold", 160))
+        track_bitrate = int(track.get("Bitrate_kbps") or 0)
+        action_mode = prefs.get("auto_action_mode", "none")
 
-        any_action_enabled = any([
-            prefs.get("action_trash"),
-            prefs.get("action_wishlist"),
-            prefs.get("action_low_quality"),
-        ])
+        # --- CRITERIA STEP 1: Bitrate Threshold Verification ---
+        if track_bitrate > 0 and track_bitrate < threshold_bitrate:
+            print(f"   -> [Automation Triggered] '{track.get('FileName')}' failed Bitrate criteria ({track_bitrate} kbps < {threshold_bitrate} kbps)")
+            return cls._execute_preference_action(track, action_mode, db_manager, "Low_Quality_Bitrate")
 
-        if not any_action_enabled or bitrate == 0 or bitrate >= threshold:
+        # --- CRITERIA STEP 2: Spectrogram High-Frequency Density Scan ---
+        spectrum_file = Path(track["SpectrumPath"])
+        density_ratio = AudioSpectrumAnalyzer.check_high_frequency_density(spectrum_file)
+
+        # CASE A: Genuine high-quality track crossing the visual line for more than half the runtime
+        if density_ratio >= 50.0:
+            cls._move_file_to_destination(track["FilePath"], Config.GOOD_FOLDER)
+            print(f"   -> [Action Log] Auto-Approved! High quality confirmed ({density_ratio:.2f}%). Moved to Good folder.")
+            return "OK"
+
+        # CASE B: Completely dead zone above the 19kHz boundary (No high frequencies at all)
+        elif density_ratio == 0.0:
+            print(f"   -> [Automation Triggered] '{track.get('FileName')}' failed Spectrogram criteria (0.0% energy above visual guide)")
+            return cls._execute_preference_action(track, action_mode, db_manager, "Dead_Spectrum")
+
+        # CASE C: Cautious Middle-Ground (Has high frequencies but less than half the runtime)
+        else:
+            print(f"   -> [Action Log] Retained for Manual Review. Track has selective high-frequency presence ({density_ratio:.2f}%).")
             return None
 
-        print(f"   -> [BitrateRule] '{track.get('FileName')}' is {bitrate} kbps "
-              f"(below threshold of {threshold} kbps). Processing actions...")
+    @classmethod
+    def _execute_preference_action(cls, track: dict, action_mode: str, db_manager: DatabaseManager, fallback_status: str) -> str | None:
+        """
+        Executes specific file handling and tracking routines mapped out in application settings.
+        """
+        if action_mode == "none":
+            return None
 
-        # --- Wishlist Action via Unified Database Architecture ---
-        if prefs.get("action_wishlist"):
-            # We call the unified manager directly to interact with the wishlist table
+        if action_mode == "low_quality_wishlist":
             db_manager.insert_wishlist_track(track)
-            print(f"   -> [BitrateAction] Added metadata to database wishlist registry table.")
-
-        # --- File System Execution Pipeline ---
-        if prefs.get("action_trash"):
-            cls._move_file_to_destination(track["FilePath"], Config.TRASH_FOLDER)
-            print(f"   -> [BitrateAction] Moved file to Trash.")
-            return "Trash"
-
-        if prefs.get("action_low_quality"):
             cls._move_file_to_destination(track["FilePath"], Config.LOW_QUALITY_FOLDER)
-            print(f"   -> [BitrateAction] Moved file to Low-Quality.")
-            return "Low-Quality"
+            print(f"   -> [Action Log] Logged to Wishlist & moved to Low-Quality archive.")
+            return "Low_Quality"
 
-        return "Wishlist"
+        elif action_mode == "trash_wishlist":
+            db_manager.insert_wishlist_track(track)
+            cls._move_file_to_destination(track["FilePath"], Config.TRASH_FOLDER)
+            print(f"   -> [Action Log] Logged to Wishlist & isolated to Trash.")
+            return "Trash_Wishlist"
+
+        elif action_mode == "trash_only":
+            cls._move_file_to_destination(track["FilePath"], Config.TRASH_FOLDER)
+            print(f"   -> [Action Log] Isolated to Trash directly without Wishlist entry.")
+            return "Trash_Only"
+
+        return None
 
 
 # ==============================================================================
-# 5. EXTERNAL API SERVICES (MusicBrainz)
+# 6. EXTERNAL API SERVICES (MusicBrainz)
 # ==============================================================================
 class MusicBrainzService:
-    """
-    Handles remote API networking queries to fetch missing metadata tags.
-    """
-
     @staticmethod
     def fetch_genre(artist: str, title: str) -> str:
-        """Queries the MusicBrainz Web API for the most popular tag/genre of a track."""
         if not artist or not title:
             return ""
-
         try:
             query = urllib.parse.quote(f'artist:"{artist}" AND recording:"{title}"')
-            url   = f"https://musicbrainz.org/ws/2/recording/?query={query}&fmt=json"
-            req   = urllib.request.Request(url, headers={'User-Agent': Config.USER_AGENT})
-
+            url = f"https://musicbrainz.org/ws/2/recording/?query={query}&fmt=json"
+            req = urllib.request.Request(url, headers={'User-Agent': Config.USER_AGENT})
             with urllib.request.urlopen(req, timeout=5) as response:
                 data = json.loads(response.read().decode())
-
                 if data.get("recordings"):
                     best_match = data["recordings"][0]
                     if "tags" in best_match:
                         sorted_tags = sorted(best_match["tags"], key=lambda x: x.get("count", 0), reverse=True)
                         if sorted_tags:
-                            found_genre = sorted_tags[0]["name"].title()
-                            print(f"   -> [API] Genre found via MusicBrainz: {found_genre}")
-                            return found_genre
+                            return sorted_tags[0]["name"].title()
         except Exception as e:
-            print(f"   -> [API-Warning] MusicBrainz unavailable or no matching tags: {e}")
-
+            print(f"   -> [API-Warning] MusicBrainz metadata retrieval bypassed: {e}")
         return ""
 
 
 # ==============================================================================
-# 6. AUDIO PROCESSOR (FFmpeg Engine Wrapper)
+# 7. AUDIO PROCESSOR (FFmpeg Engine Wrapper)
 # ==============================================================================
 class AudioProcessor:
-    """
-    Encapsulates all technical audio demuxing, metadata extraction, and tagging routines.
-    """
-
     @staticmethod
     def _run_ffmpeg(command: list) -> str:
-        """Executes a given FFmpeg subprocess command natively and returns console output."""
-        result = subprocess.run(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="ignore"
-        )
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                errors="ignore")
         return result.stdout
 
     @classmethod
     def check_is_corrupted(cls, file_path: Path) -> bool:
-        """Asks FFmpeg to scan the stream packet containers to detect file corruption."""
         command = ["ffmpeg", "-v", "error", "-i", str(file_path), "-f", "null", "-"]
-        result  = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return result.returncode != 0
 
     @classmethod
     def generate_spectrogram(cls, audio_file: Path) -> Path:
-        """Generates a high-definition 1080p visual spectrogram picture of the audio file."""
         output_file = Config.SPECTROGRAMS_FOLDER / f"{audio_file.stem}-spectrogram.png"
-        command = [
-            "ffmpeg", "-y", "-i", str(audio_file), "-lavfi",
-            "showspectrumpic=s=1920x1080", "-update", "1", str(output_file)
-        ]
+        # CRITICAL: legend=0 removes all gridlines, borders, text, and axes from the image.
+        command = ["ffmpeg", "-y", "-i", str(audio_file), "-lavfi", "showspectrumpic=s=1920x1080:legend=0", "-update",
+                   "1",
+                   str(output_file)]
         cls._run_ffmpeg(command)
         return output_file
 
     @classmethod
     def extract_metadata(cls, audio_file: Path) -> dict:
-        """Parses FFmpeg's technical stream console printout to collect tags and stats."""
         command = ["ffmpeg", "-i", str(audio_file)]
-        output  = cls._run_ffmpeg(command)
-
-        info = {
-            "Bitrate_kbps": 0, "SampleRate_Hz": 0, "Channels": 0,
-            "Duration": "Unknown", "Artist": None, "Title": None, "Genre": None
-        }
+        output = cls._run_ffmpeg(command)
+        info = {"Bitrate_kbps": 0, "SampleRate_Hz": 0, "Channels": 0, "Duration": "Unknown", "Artist": None,
+                "Title": None, "Genre": None}
 
         bitrate = re.search(r"bitrate: (\d+) kb/s", output)
         if bitrate: info["Bitrate_kbps"] = int(bitrate.group(1))
-
         samplerate = re.search(r"(\d+) Hz", output)
         if samplerate: info["SampleRate_Hz"] = int(samplerate.group(1))
-
         if "stereo" in output.lower():
             info["Channels"] = 2
         elif "mono" in output.lower():
             info["Channels"] = 1
-
         duration = re.search(r"Duration: (\d+:\d+:\d+\.\d+)", output)
         if duration: info["Duration"] = duration.group(1)
-
         artist = re.search(r"artist\s*:\s*(.+)", output, re.IGNORECASE)
         if artist: info["Artist"] = artist.group(1).strip()
-
         title = re.search(r"title\s*:\s*(.+)", output, re.IGNORECASE)
         if title: info["Title"] = title.group(1).strip()
-
         genre = re.search(r"genre\s*:\s*(.+)", output, re.IGNORECASE)
         if genre: info["Genre"] = genre.group(1).strip()
-
         return info
 
     @classmethod
     def write_metadata_to_file(cls, audio_file: Path, genre: str):
-        """
-        Writes newly fetched metadata (like Genre) directly back into the physical audio file.
-        Uses FFmpeg stream-copying (-c:a copy) to preserve original quality without re-encoding.
-        """
-        if not genre:
-            return
-
-        print(f"   -> [File-Tagging] Writing updated genre '{genre}' into the audio file...")
+        if not genre: return
         temp_file = audio_file.parent / f"temp_{audio_file.name}"
-
-        command = [
-            "ffmpeg", "-y", "-i", str(audio_file),
-            "-metadata", f"genre={genre}",
-            "-c:a", "copy", str(temp_file)
-        ]
+        command = ["ffmpeg", "-y", "-i", str(audio_file), "-metadata", f"genre={genre}", "-c:a", "copy", str(temp_file)]
         cls._run_ffmpeg(command)
-
         if temp_file.exists() and temp_file.stat().st_size > 0:
             os.replace(str(temp_file), str(audio_file))
         else:
-            if temp_file.exists():
-                os.remove(str(temp_file))
-            print(f"   -> [Error] Failed to write metadata back to {audio_file.name}")
+            if temp_file.exists(): os.remove(str(temp_file))
 
 
 # ==============================================================================
-# 7. CORE EXECUTION PIPELINE
+# 8. CORE EXECUTION PIPELINE
 # ==============================================================================
 def main():
-    """Orchestrates directories, scans input audio files, applies bitrate rules, and logs results."""
-
-    # 1. Initialize all project directory components
-    for folder in [
-        Config.INPUT_FOLDER,
-        Config.SPECTROGRAMS_FOLDER,
-        Config.CORRUPTED_FOLDER,
-        Config.TRASH_FOLDER,
-        Config.LOW_QUALITY_FOLDER,
-        Config.DATABASE_FOLDER,
-    ]:
+    for folder in [Config.INPUT_FOLDER, Config.SPECTROGRAMS_FOLDER, Config.CORRUPTED_FOLDER, Config.TRASH_FOLDER,
+                   Config.LOW_QUALITY_FOLDER, Config.GOOD_FOLDER, Config.DATABASE_FOLDER]:
         folder.mkdir(parents=True, exist_ok=True)
 
-    # 2. Load user preferences once for the entire batch run
     prefs = PreferencesLoader.load()
-
-    # 3. Fire up the relational DB engine layer
     db = DatabaseManager(Config.DB_FILE)
     already_processed = db.get_processed_file_paths()
 
-    # 4. Scan the source folder recursively for valid music items
-    audio_files       = [f for f in Config.INPUT_FOLDER.rglob("*") if f.suffix.lower() in Config.SUPPORTED_EXTENSIONS]
+    audio_files = [f for f in Config.INPUT_FOLDER.rglob("*") if f.suffix.lower() in Config.SUPPORTED_EXTENSIONS]
     new_tracks_counter = 0
 
     print(f"Launching BatchQC Pipeline. Logging to: {Config.DB_FILE.name}")
@@ -469,26 +422,19 @@ def main():
 
     for audio_file in audio_files:
         file_path_str = str(audio_file.resolve())
-
-        # Skip track if it was already logged during a previous session
         if file_path_str in already_processed:
             continue
 
         print(f"\nProcessing: {audio_file.name}")
 
-        # Integrity check: Filter out and isolate corrupted audio tracks
         if AudioProcessor.check_is_corrupted(audio_file):
             print("   -> [WARNING] File corrupted! Isolating track to 'Corrupted' folder.")
             shutil.move(str(audio_file), str(Config.CORRUPTED_FOLDER / audio_file.name))
             continue
 
-        # Render spectral signature diagnostics
         spectrum_img = AudioProcessor.generate_spectrogram(audio_file)
-
-        # Parse local internal audio container streams
         meta = AudioProcessor.extract_metadata(audio_file)
 
-        # Fallback API check: If local genre is missing BUT Artist & Title exist, fetch via MusicBrainz
         has_new_metadata_to_write = False
         if not meta["Genre"] and meta["Artist"] and meta["Title"]:
             fetched_genre = MusicBrainzService.fetch_genre(meta["Artist"], meta["Title"])
@@ -496,34 +442,26 @@ def main():
                 meta["Genre"] = fetched_genre
                 has_new_metadata_to_write = True
 
-        # Write metadata tags back directly into the file if updated
         if has_new_metadata_to_write:
             AudioProcessor.write_metadata_to_file(audio_file, meta["Genre"])
 
-        # Build the track dict that BitrateActionHandler and the DB both consume
         track_data = {
-            "FileName":     audio_file.stem,
-            "FilePath":     file_path_str,
-            "Artist":       meta["Artist"],
-            "Title":        meta["Title"],
-            "Genre":        meta["Genre"],
+            "FileName": audio_file.stem,
+            "FilePath": file_path_str,
+            "Artist": meta["Artist"],
+            "Title": meta["Title"],
+            "Genre": meta["Genre"],
             "Bitrate_kbps": meta["Bitrate_kbps"],
-            "SampleRate_Hz":meta["SampleRate_Hz"],
-            "Channels":     meta["Channels"],
-            "Duration":     meta["Duration"],
+            "SampleRate_Hz": meta["SampleRate_Hz"],
+            "Channels": meta["Channels"],
+            "Duration": meta["Duration"],
             "SpectrumPath": str(spectrum_img),
         }
 
-        # --- Apply bitrate rule from Preferences ---
-        # Returns a status string ("Trash", "Low-Quality", "Wishlist") if a rule fired,
-        # or None if the track is within acceptable quality and should be reviewed manually.
-        auto_status = BitrateActionHandler.apply(track_data, prefs, db)
+        # --- Automated Multi-Criteria Logic Evaluation ---
+        auto_status = AutomatedActionHandler.process_rules(track_data, prefs, db)
+        track_data["Status"] = auto_status
 
-        # Tracks that pass the bitrate check are queued for manual review (Status = None / pending)
-        # Tracks that triggered an auto-action receive the corresponding status label.
-        track_data["Status"] = auto_status  # None = pending in the Flask queue
-
-        # Save record to report database
         db.insert_qc_track(track_data)
         new_tracks_counter += 1
 
