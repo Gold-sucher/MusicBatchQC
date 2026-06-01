@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BatchQC - Wishlist Manager</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <header class="app-header">
+        <div class="header-container">
+            <h1>BatchQC Wishlist Manager</h1>
+            <nav class="navigation-links">
+                <a href="/" class="nav-btn">← Back to Dashboard</a>
+                <a href="/wishlist/export" class="nav-btn export-btn">📥 Export to CSV</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="main-content">
+        <section class="form-section-card">
+            <h2>Add New Entry Manually</h2>
+            <form action="/wishlist" method="POST" class="horizontal-input-form">
+                <div class="input-group">
+                    <label for="artist">Artist *</label>
+                    <input type="text" id="artist" name="artist" placeholder="e.g. Daft Punk" required>
+                </div>
+                <div class="input-group">
+                    <label for="title">Track Title *</label>
+                    <input type="text" id="title" name="title" placeholder="e.g. One More Time" required>
+                </div>
+                <div class="input-group">
+                    <label for="genre">Genre (Optional)</label>
+                    <input type="text" id="genre" name="genre" placeholder="e.g. French House">
+                </div>
+                <button type="submit" class="submit-add-btn">+ Add Item</button>
+            </form>
+        </section>
+
+        <section class="table-section-card">
+            <h2>Current Wanted Tracks (Total: {{ items|length }})</h2>
+            {% if items %}
+                <table class="wishlist-data-table">
+                    <thead>
+                        <tr>
+                            <th>Artist</th>
+                            <th>Title</th>
+                            <th>Genre</th>
+                            <th>Discovered Via / File Source</th>
+                            <th>Date Added</th>
+                            <th class="action-column-header">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for item in items %}
+                            <tr>
+                                <td class="font-bold">{{ item.Artist }}</td>
+                                <td>{{ item.Title }}</td>
+                                <td><span class="genre-tag">{{ item.Genre if item.Genre else 'N/A' }}</span></td>
+                                <td class="text-muted text-small">{{ item.FileName }}</td>
+                                <td class="text-small">{{ item.DateAdded }}</td>
+                                <td>
+                                    <form action="/wishlist/delete/{{ item.id }}" method="POST" onsubmit="return confirm('Are you sure you want to drop this entry?');">
+                                        <button type="submit" class="action-delete-btn">🗑️ Delete</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <div class="empty-state-notice">
+                    <p>Your wishlist is currently completely empty. High-quality hunting success!</p>
+                </div>
+            {% endif %}
+        </section>
+    </main>
+</body>
+</html>

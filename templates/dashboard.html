@@ -27,7 +27,7 @@
       margin-bottom: 25px;
     }
 
-    /* Header right side: groups the Maintenance, Undo, Preferences and Analyze buttons */
+    /* Header right side: groups navigation, maintenance, undo, and automation triggers */
     .header-actions {
       display: flex;
       align-items: center;
@@ -80,6 +80,9 @@
       border: 1px solid transparent;
       cursor: pointer;
       font-size: 0.875rem;
+      text-decoration: none; /* Enforces clean button alignment for link-based elements */
+      display: inline-flex;
+      align-items: center;
       transition: opacity 0.15s, background 0.15s;
     }
     .btn:disabled {
@@ -111,7 +114,7 @@
       color: #000;
     }
 
-    /* Secondary — outlined grey: Undo */
+    /* Secondary — outlined grey: Undo / Navigation */
     .btn-secondary {
       background-color: #fff;
       color: #495057;
@@ -417,6 +420,8 @@
     </div>
 
     <div class="header-actions">
+      <a href="{{ url_for('wishlist_view') }}" class="btn btn-secondary">📋 View Wishlist</a>
+
       <form action="{{ url_for('empty_trash') }}" method="post" onsubmit="return confirm('Permanently delete all items inside the trash folder?');">
         <button type="submit" class="btn btn-danger-outline">Empty Trash</button>
       </form>

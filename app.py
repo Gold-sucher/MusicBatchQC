@@ -22,7 +22,9 @@ import shutil
 from datetime import date, datetime
 from pathlib import Path
 from collections import deque
-from flask import Flask, render_template, request, redirect, url_for, send_from_directory, jsonify, flash, session
+import csv
+import io
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, jsonify, flash, session, Response
 
 app = Flask(__name__)
 # Required for flash messages and session state signature verification
@@ -611,6 +613,80 @@ def api_get_preferences():
     """Exposes serialized state vectors of configuration preferences."""
     return jsonify(PreferencesService.load())
 
+
+# ==============================================================================
+# WISHLIST CONFIGURATION & ROUTING COMPLEX
+# ==============================================================================
+import sys
+import importlib.util
+
+# Append scripts directory path to system runtime vector if not present
+_scripts_path_inject = os.path.join(os.path.dirname(__file__), 'scripts')
+if _scripts_path_inject not in sys.path:
+    sys.path.append(_scripts_path_inject)
+
+# Safely extract module constraints bypassing standard hyphen limitations
+_target_module_file = os.path.join(_scripts_path_inject, 'analyze-tracks.py')
+_module_spec = importlib.util.spec_from_file_location("analyze_tracks_backend", _target_module_file)
+_dynamic_module = importlib.util.module_from_spec(_module_spec)
+_module_spec.loader.exec_module(_dynamic_module)
+
+# Initialize the global DatabaseManager instance targeting your main storage file
+db = _dynamic_module.DatabaseManager(WebConfig.DB_FILE)
+
+
+@app.route('/wishlist', methods=['GET', 'POST'])
+def wishlist_view():
+    """
+    Renders the central wishlist dashboard view component and catches
+    manual item insertion requests.
+    """
+    if request.method == 'POST':
+        artist = request.form.get('artist', '')
+        title = request.form.get('title', '')
+        genre = request.form.get('genre', '')
+
+        if artist and title:
+            db.add_manual_wishlist_item(artist, title, genre)
+        return redirect(url_for('wishlist_view'))
+
+    # Query all processed or manually added wishlist rows from SQLite ledger
+    wishlist_items = db.get_all_wishlist_items()
+    return render_template('wishlist.html', items=wishlist_items)
+
+
+@app.route('/wishlist/delete/<int:item_id>', methods=['POST'])
+def wishlist_delete(item_id):
+    """
+    Endpoint mapping handler to drop a specific record from the database ledger.
+    """
+    db.delete_wishlist_item(item_id)
+    return redirect(url_for('wishlist_view'))
+
+
+@app.route('/wishlist/export', methods=['GET'])
+def wishlist_export_csv():
+    """
+    Generates an RFC 4180 compliant CSV text stream on-the-fly and forces
+    an instant file attachment download dialog inside the browser.
+    """
+    wishlist_items = db.get_all_wishlist_items()
+
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+
+    # Write structural CSV header matrix
+    writer.writerow(['ID', 'Artist', 'Title', 'Genre', 'Source File Name', 'Date Added'])
+
+    for item in wishlist_items:
+        writer.writerow([item['id'], item['Artist'], item['Title'], item['Genre'], item['FileName'], item['DateAdded']])
+
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-disposition": "attachment; filename=batchqc_wishlist_export.csv"}
+    )
 
 if __name__ == '__main__':
     # Initialize unified database scheme layouts cleanly on server launch bindings

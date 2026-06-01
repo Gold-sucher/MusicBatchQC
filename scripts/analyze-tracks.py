@@ -79,11 +79,14 @@ class DatabaseManager:
     def _initialize_database_schema(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._get_connection() as conn:
+            # UNIQUE constraint is removed from FilePath to allow the same path
+            # to exist multiple times if the file size (quality) changes.
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS qc_report (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     FileName TEXT,
-                    FilePath TEXT UNIQUE,
+                    FilePath TEXT,
+                    FileSize_Bytes INTEGER,
                     Artist TEXT,
                     Title TEXT,
                     Genre TEXT,
@@ -110,23 +113,32 @@ class DatabaseManager:
             conn.commit()
 
     def get_processed_file_paths(self) -> set:
-        query_string = "SELECT FilePath FROM qc_report"
+        """
+        Fetches unique combinations of FilePath and FileSize_Bytes to determine
+        if a specific version of a file has already been analyzed.
+        """
+        query_string = "SELECT FilePath, FileSize_Bytes FROM qc_report"
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query_string)
-            return {row[0] for row in cursor.fetchall()}
+            # Returns a set of tuples: { (path1, size1), (path2, size2), ... }
+            return {(row[0], row[1]) for row in cursor.fetchall()}
 
     def insert_qc_track(self, track_metadata: dict):
+        """
+        Inserts a completed track quality report into the local database ledger.
+        """
         insert_query = '''
             INSERT INTO qc_report (
-                FileName, FilePath, Artist, Title, Genre,
+                FileName, FilePath, FileSize_Bytes, Artist, Title, Genre,
                 Bitrate_kbps, SampleRate_Hz, Channels, Duration, SpectrumPath, Status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         '''
         with self._get_connection() as conn:
             conn.execute(insert_query, (
                 track_metadata["FileName"],
                 track_metadata["FilePath"],
+                track_metadata["FileSize_Bytes"],  # Injected dynamic size verification step
                 track_metadata["Artist"],
                 track_metadata["Title"],
                 track_metadata["Genre"],
@@ -154,6 +166,60 @@ class DatabaseManager:
             ))
             conn.commit()
 
+    def get_cleanup_spectrogram_paths(self) -> list:
+        """
+        Fetches all spectrogram paths for tracks that have already been finalized
+        (either automatically or manually approved/rejected).
+        """
+        # We select paths where Status is not NULL and not an empty string
+        query_string = "SELECT SpectrumPath FROM qc_report WHERE Status IS NOT NULL AND Status != ''"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query_string)
+            return [row[0] for row in cursor.fetchall() if row[0]]
+
+    def get_all_wishlist_items(self) -> list:
+        """
+        Retrieves all entries from the wishlist table sorted by the date they were added.
+        """
+        query_string = "SELECT id, Artist, Title, Genre, FileName, DateAdded FROM wishlist ORDER BY id DESC"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query_string)
+            # Fetch all as dictionaries for easier rendering in Flask templates
+            return [
+                {
+                    "id": row[0],
+                    "Artist": row[1],
+                    "Title": row[2],
+                    "Genre": row[3],
+                    "FileName": row[4],
+                    "DateAdded": row[5]
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def add_manual_wishlist_item(self, artist: str, title: str, genre: str = "") -> bool:
+        """
+        Manually injects a new track request into the wishlist table.
+        """
+        insert_query = '''
+            INSERT OR IGNORE INTO wishlist (Artist, Title, Genre, FileName, DateAdded)
+            VALUES (?, ?, ?, ?, date('now'))
+        '''
+        with self._get_connection() as conn:
+            cursor = conn.execute(insert_query, (artist.strip(), title.strip(), genre.strip(), "Manually Added"))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_wishlist_item(self, item_id: int):
+        """
+        Permanently drops a specific wishlist entry by its primary key ID.
+        """
+        delete_query = "DELETE FROM wishlist WHERE id = ?"
+        with self._get_connection() as conn:
+            conn.execute(delete_query, (item_id,))
+            conn.commit()
 
 # ==============================================================================
 # 3. PREFERENCES LOADER
@@ -406,35 +472,94 @@ class AudioProcessor:
 # 8. CORE EXECUTION PIPELINE
 # ==============================================================================
 def main():
-    for folder in [Config.INPUT_FOLDER, Config.SPECTROGRAMS_FOLDER, Config.CORRUPTED_FOLDER, Config.TRASH_FOLDER,
-                   Config.LOW_QUALITY_FOLDER, Config.GOOD_FOLDER, Config.DATABASE_FOLDER]:
+    """
+    Main execution pipeline for the BatchQC audio analysis system.
+    Handles environmental checks, folder initialization, database cleanup,
+    metadata extraction, and rule-based automation routing.
+    """
+    # --- CRITICAL: Environmental Dependency Verification ---
+    # Ensure FFmpeg is installed globally and accessible via the system PATH
+    if not shutil.which("ffmpeg"):
+        print("\n" + "!" * 80)
+        print("[CRITICAL ERROR] FFmpeg was not found on your system!")
+        print("This framework requires FFmpeg to extract audio data and build spectrograms.")
+        print("Please install FFmpeg and append its 'bin' directory to your system's PATH.")
+        print("Refer to the project's README.md for a detailed step-by-step setup guide.")
+        print("!" * 80 + "\n")
+        return  # Gracefully abort execution to prevent downstream processing failures
+
+    # --- Directory Structure Initialization ---
+    # Automatically generate required system folders if they do not exist
+    for folder in [Config.INPUT_FOLDER, Config.SPECTROGRAMS_FOLDER, Config.CORRUPTED_FOLDER,
+                   Config.TRASH_FOLDER, Config.LOW_QUALITY_FOLDER, Config.GOOD_FOLDER,
+                   Config.DATABASE_FOLDER]:
         folder.mkdir(parents=True, exist_ok=True)
 
+    # --- Configuration and Environment Setup ---
     prefs = PreferencesLoader.load()
     db = DatabaseManager(Config.DB_FILE)
-    already_processed = db.get_processed_file_paths()
-
-    audio_files = [f for f in Config.INPUT_FOLDER.rglob("*") if f.suffix.lower() in Config.SUPPORTED_EXTENSIONS]
-    new_tracks_counter = 0
 
     print(f"Launching BatchQC Pipeline. Logging to: {Config.DB_FILE.name}")
     print("-" * 80)
 
+    # ==========================================================================
+    # --- AUTOMATED SPECTROGRAM CLEANUP ENGINE ---
+    # ==========================================================================
+    # Purge localized spectrogram cache files belonging to fully settled tracks
+    # (Processes both auto-sorted tracks and user-approved manual queue tracks)
+    print("[Cleanup] Querying database for finalized track records...")
+    cleanup_paths = db.get_cleanup_spectrogram_paths()
+    deleted_images_counter = 0
+
+    for path_str in cleanup_paths:
+        img_path = Path(path_str)
+        if img_path.exists():
+            try:
+                img_path.unlink()
+                deleted_images_counter += 1
+            except Exception as e:
+                print(f"   -> [Cleanup-Warning] Failed to purge storage asset {img_path.name}: {e}")
+
+    if deleted_images_counter > 0:
+        print(
+            f"   -> [Cleanup Success] Removed {deleted_images_counter} obsolete spectrogram image(s) from historical sessions.")
+    else:
+        print("   -> [Cleanup] Storage is optimized. No obsolete session assets found.")
+    print("-" * 80)
+    # ==========================================================================
+
+    # Cache historically registered files to guarantee idempotent batch execution
+    already_processed = db.get_processed_file_paths()
+
+    # Discover target audio inventory matching specified extension rules
+    audio_files = [f for f in Config.INPUT_FOLDER.rglob("*") if f.suffix.lower() in Config.SUPPORTED_EXTENSIONS]
+    new_tracks_counter = 0
+
+    # --- Main Input Inventory Traversal ---
     for audio_file in audio_files:
         file_path_str = str(audio_file.resolve())
-        if file_path_str in already_processed:
+
+        # Bypass files that have already been audited and committed to the database
+        file_path_str = str(audio_file.resolve())
+        file_size_bytes = audio_file.stat().st_size  # Dynamically get current file size in bytes
+
+        # Check if this specific file version (Path + Size combination) was already processed
+        if (file_path_str, file_size_bytes) in already_processed:
             continue
 
         print(f"\nProcessing: {audio_file.name}")
 
+        # Stream integrity check to eliminate broken or unreadable container files
         if AudioProcessor.check_is_corrupted(audio_file):
-            print("   -> [WARNING] File corrupted! Isolating track to 'Corrupted' folder.")
+            print("   -> [WARNING] File payload corrupted! Isolating track to 'Corrupted' folder.")
             shutil.move(str(audio_file), str(Config.CORRUPTED_FOLDER / audio_file.name))
             continue
 
+        # Analytical transformations and metadata extraction routines
         spectrum_img = AudioProcessor.generate_spectrogram(audio_file)
         meta = AudioProcessor.extract_metadata(audio_file)
 
+        # Fallback Metadata Enrichment via remote Open-Source Web Registries (MusicBrainz)
         has_new_metadata_to_write = False
         if not meta["Genre"] and meta["Artist"] and meta["Title"]:
             fetched_genre = MusicBrainzService.fetch_genre(meta["Artist"], meta["Title"])
@@ -442,12 +567,15 @@ def main():
                 meta["Genre"] = fetched_genre
                 has_new_metadata_to_write = True
 
+        # Commit metadata mutations directly back into the native audio container tags
         if has_new_metadata_to_write:
             AudioProcessor.write_metadata_to_file(audio_file, meta["Genre"])
 
+        # Unified tracking dataset structure mapping
         track_data = {
             "FileName": audio_file.stem,
             "FilePath": file_path_str,
+            "FileSize_Bytes": file_size_bytes,
             "Artist": meta["Artist"],
             "Title": meta["Title"],
             "Genre": meta["Genre"],
@@ -459,9 +587,12 @@ def main():
         }
 
         # --- Automated Multi-Criteria Logic Evaluation ---
+        # Filters low bitrates first, analyzes canvas spectrum boundaries next,
+        # and routes compliant high-quality items directly to the good-quality pool.
         auto_status = AutomatedActionHandler.process_rules(track_data, prefs, db)
         track_data["Status"] = auto_status
 
+        # Permanent ledger entry serialization
         db.insert_qc_track(track_data)
         new_tracks_counter += 1
 
