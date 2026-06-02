@@ -399,6 +399,33 @@
       grid-template-columns: repeat(2, 1fr);
       gap: 12px;
     }
+
+    /* ============================================================
+       NEW: INTERACTIVE DUPLICATE RESOLUTION MODAL STYLES
+       ============================================================ */
+    .custom-modal-overlay {
+      position: fixed;
+      top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.65);
+      display: flex; justify-content: center; align-items: center;
+      z-index: 10000;
+    }
+    .custom-modal-card {
+      background: #ffffff; padding: 25px; border-radius: 8px;
+      max-width: 480px; width: 90%; box-shadow: 0 5px 20px rgba(0,0,0,0.3);
+    }
+    .custom-modal-card h3 { margin-top: 0; color: #dc3545; font-size: 20px; }
+    .modal-form-group { margin: 20px 0; }
+    .modal-dropdown-element {
+      width: 100%; padding: 10px; margin-top: 6px;
+      border: 1px solid #ced4da; border-radius: 4px; font-size: 14px;
+    }
+    .modal-actions-panel { display: flex; justify-content: flex-end; }
+    .modal-action-btn {
+      padding: 10px 18px; border: none; border-radius: 4px; font-weight: bold; cursor: pointer;
+    }
+    .modal-action-btn.primary { background-color: #0d6efd; color: white; }
+    .modal-action-btn.primary:disabled { background-color: #a8cbfb; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -650,6 +677,29 @@
     </div>
   </div>
 
+  <div id="duplicate-modal" class="custom-modal-overlay" style="display: none;">
+    <div class="custom-modal-card">
+      <h3>Duplicate Tracks Located</h3>
+      <p id="duplicate-modal-text">We detected audio files inside your input directory that have already been parsed and logged to the system core ledger. Choose a processing strategy:</p>
+
+      <div class="modal-form-group">
+        <label for="duplicate-action-select" style="font-weight: bold; font-size: 14px;">Resolution Action:</label>
+        <select id="duplicate-action-select" class="modal-dropdown-element">
+          <option value="none">Leave in Input-Folder</option>
+          <option value="trash_wishlist">Move to Trash and put on Wishlist</option>
+          <option value="trash_only">Move to trash without wishlist</option>
+          <option value="good_only">Move to Good-quality</option>
+          <option value="low_quality_wishlist">Move to low-quality and set on wishlist</option>
+          <option value="low_quality_only">Move to low-quality and not set on wishlist</option>
+        </select>
+      </div>
+
+      <div class="modal-actions-panel">
+        <button id="confirm-resolution-btn" class="modal-action-btn primary" onclick="submitDuplicateResolution()">Execute Resolution</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     // System active configuration cache vector injection mappings
     const hotkeys = {
@@ -709,24 +759,89 @@
 
     /**
      * Performs background polling tasks checking audio analysis processing locks.
+     * Aligned natively to monitor background worker threads and handle duplicates.
      */
     function checkAnalysisStatus() {
-      fetch('/api/status')
-        .then(res => res.json())
+      // Geändert von /api/status auf /api/analysis-status, um den 404-Fehler zu beheben
+      fetch('/api/analysis-status')
+        .then(res => {
+          // Falls die Route immer noch einen Fehler wirft, fangen wir ihn hier ab
+          if (!res.ok) {
+            throw new Error(`Server returned status ${res.status} for /api/analysis-status`);
+          }
+          return res.json();
+        })
         .then(data => {
           const btn = document.getElementById('analysis-btn');
-          if (data.is_running) {
-            if (btn.tagName === 'BUTTON') {
+
+          // Flexibel für beide Varianten ("is_running" oder "is_analysis_running")
+          const running = (data.is_running !== undefined) ? data.is_running : data.is_analysis_running;
+
+          if (running) {
+            if (btn && btn.tagName === 'BUTTON') {
               btn.disabled = true;
               btn.innerText = "Analyzing Pipeline...";
             }
             setTimeout(checkAnalysisStatus, 2000);
           } else {
-            if (btn.disabled && btn.innerText === "Analyzing Pipeline...") {
-              window.location.reload();
-            }
+            console.log("Analysis finished. Querying duplicate staging database maps...");
+
+            // Backend ist fertig -> Sofort nach Duplikaten gucken
+            fetch('/api/check-duplicates')
+              .then(res => res.json())
+              .then(dupData => {
+                if (dupData.duplicate_count > 0) {
+                  // Duplikate gefunden! Zeige das Pop-up-Modal an
+                  document.getElementById('duplicate-modal-text').innerText =
+                    `The pipeline discovered ${dupData.duplicate_count} files in your input directory that were already processed. How would you like to handle them?`;
+                  document.getElementById('duplicate-modal').style.display = 'flex';
+                } else {
+                  // Keine Duplikate -> Seite normal neu laden
+                  if (btn && btn.disabled && btn.innerText === "Analyzing Pipeline...") {
+                    window.location.reload();
+                  }
+                }
+              }).catch(err => {
+                console.error("Error evaluating batch duplicates staging context: ", err);
+                window.location.reload();
+              });
           }
-        }).catch(err => console.error("Polling execution context breakdown: ", err));
+        }).catch(err => {
+          console.error("Polling breakdown or Route Not Found (404): ", err);
+          // Falls /api/analysis-status fehlschlägt, probieren wir als letzten Rettungsanker /api/status
+          if (err.message.includes("404") || err.message.includes("status 404")) {
+             // Fallback-Reload, damit die UI nicht blockiert bleibt
+             window.location.reload();
+          }
+        });
+    }
+
+    /**
+     * Collects resolution parameters and posts choice vectors down to Flask api end nodes.
+     */
+    function submitDuplicateResolution() {
+      const selection = document.getElementById('duplicate-action-select').value;
+      const confirmBtn = document.getElementById('confirm-resolution-btn');
+
+      confirmBtn.disabled = true;
+      confirmBtn.innerText = "Processing Assets...";
+
+      fetch('/api/resolve-duplicates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action_mode: selection })
+      })
+      .then(res => res.json())
+      .then(data => {
+        // Clear frame and refresh application layer states
+        document.getElementById('duplicate-modal').style.display = 'none';
+        window.location.reload();
+      })
+      .catch(err => {
+        console.error("Resolution transaction failure: ", err);
+        confirmBtn.disabled = false;
+        confirmBtn.innerText = "Execute Resolution";
+      });
     }
 
     /**

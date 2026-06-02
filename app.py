@@ -563,7 +563,7 @@ def start_transform():
     return redirect(url_for('index'))
 
 
-@app.route('/api/status')
+@app.route('/api/analysis-status', methods=['GET'])
 def get_status():
     """Polling interface monitoring context status indicators for analysis pipeline."""
     return jsonify({"is_running": WebConfig.is_analysis_running})
@@ -708,6 +708,133 @@ def wishlist_export_csv():
         mimetype="text/csv",
         headers={"Content-disposition": "attachment; filename=batchqc_wishlist_export.csv"}
     )
+
+
+# ==============================================================================
+# ROUTINES FOR INTERACTIVE DUPLICATE RESOLUTION PIPELINES (GENERIC & EXTENSIBLE)
+# ==============================================================================
+
+@app.route('/api/check-duplicates', methods=['GET'])
+def check_duplicates():
+    """
+    API endpoint that queries the transient staging buffer database table.
+    Returns the count of found duplicate tracks to the frontend polling loop.
+    """
+    db_path = WebConfig.DB_FILE
+    try:
+        with sqlite3.connect(db_path) as conn:
+            # Ensure table exists dynamically in case initialization was skipped
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS duplicate_staging (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    FilePath TEXT UNIQUE,
+                    FileName TEXT,
+                    FileSize_Bytes INTEGER,
+                    Artist TEXT,
+                    Title TEXT,
+                    Genre TEXT
+                )
+            ''')
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM duplicate_staging")
+            count = cursor.fetchone()[0]
+        return jsonify({"duplicate_count": count})
+    except Exception as e:
+        print(f"[API Error] Failed checking duplicate staging table: {e}")
+        return jsonify({"duplicate_count": 0, "error": str(e)}), 500
+
+
+@app.route('/api/resolve-duplicates', methods=['POST'])
+def resolve_duplicates():
+    """
+    Processes all staged duplicates based on the action mode provided by the UI.
+    Supported modes match the core application design criteria:
+    - 'none' (Leave in Input-Folder)
+    - 'trash_wishlist' (Move to Trash and put on Wishlist)
+    - 'trash_only' (Move to trash without wishlist)
+    - 'good_only' (Move to Good-quality)
+    - 'low_quality_wishlist' (Move to low-quality and set on wishlist)
+    - 'low_quality_only' (Move to low-quality and not set on wishlist)
+    """
+    data = request.get_json() or {}
+    action_mode = data.get("action_mode", "none")
+    db_path = WebConfig.DB_FILE
+
+    try:
+        # 1. Fetch all currently staged duplicate records
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT FilePath, FileName, FileSize_Bytes, Artist, Title, Genre FROM duplicate_staging")
+            duplicates = [dict(row) for row in cursor.fetchall()]
+
+        # If action is 'none', user wants to keep files in input folder. We just clear the staging ledger.
+        if not duplicates or action_mode == "none":
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("DELETE FROM duplicate_staging")
+            return jsonify({"status": "success", "message": "Duplicates preserved in Input-Folder.", "processed": 0})
+
+        # 2. Set up unified destination storage nodes matching project guidelines
+        output_base = WebConfig.PROJECT_ROOT / "output"
+        good_dir = output_base / "good-quality"
+        low_quality_dir = output_base / "low-quality"
+        trash_dir = output_base / "trash"
+
+        processed_count = 0
+
+        # 3. Iterate through staging elements and apply routing rules natively
+        for item in duplicates:
+            source_path = item["FilePath"]
+            if not os.path.exists(source_path):
+                continue
+
+            file_name_raw = os.path.basename(source_path)
+
+            # Action Mode Switch Matrix
+            if action_mode == "trash_wishlist":
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO wishlist (Artist, Title, Genre, FileName, DateAdded) VALUES (?, ?, ?, ?, date('now'))",
+                        (item["Artist"], item["Title"], item["Genre"], item["FileName"])
+                    )
+                trash_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(source_path, str(trash_dir / file_name_raw))
+
+            elif action_mode == "trash_only":
+                trash_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(source_path, str(trash_dir / file_name_raw))
+
+            elif action_mode == "good_only":
+                good_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(source_path, str(good_dir / file_name_raw))
+
+            elif action_mode == "low_quality_wishlist":
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO wishlist (Artist, Title, Genre, FileName, DateAdded) VALUES (?, ?, ?, ?, date('now'))",
+                        (item["Artist"], item["Title"], item["Genre"], item["FileName"])
+                    )
+                low_quality_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(source_path, str(low_quality_dir / file_name_raw))
+
+            elif action_mode == "low_quality_only":
+                low_quality_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(source_path, str(low_quality_dir / file_name_raw))
+
+            processed_count += 1
+
+        # 4. Flush transient staging database log tables to reset state cleanly
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DELETE FROM duplicate_staging")
+
+        return jsonify({
+            "status": "success",
+            "message": f"Successfully processed {processed_count} duplicate files using '{action_mode}' configuration."
+        })
+
+    except Exception as e:
+        print(f"[API Error] Failed resolving duplicate files batch layout: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
     # Initialize unified database scheme layouts cleanly on server launch bindings
