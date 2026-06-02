@@ -26,6 +26,7 @@ import json
 import os
 import urllib.request
 import urllib.parse
+import argparse
 from datetime import date
 from pathlib import Path
 
@@ -221,6 +222,7 @@ class DatabaseManager:
             conn.execute(delete_query, (item_id,))
             conn.commit()
 
+
 # ==============================================================================
 # 3. PREFERENCES LOADER
 # ==============================================================================
@@ -230,7 +232,8 @@ class PreferencesLoader:
     """
     FALLBACK = {
         "bitrate_threshold": 160,
-        "auto_action_mode": "none"  # Options: "none", "low_quality_wishlist", "trash_wishlist", "trash_only"
+        "auto_action_mode": "none",  # Options: "none", "low_quality_wishlist", "trash_wishlist", "trash_only"
+        "low_quality_folder": "output/low-quality"
     }
 
     @classmethod
@@ -329,8 +332,9 @@ class AutomatedActionHandler:
 
         # --- CRITERIA STEP 1: Bitrate Threshold Verification ---
         if track_bitrate > 0 and track_bitrate < threshold_bitrate:
-            print(f"   -> [Automation Triggered] '{track.get('FileName')}' failed Bitrate criteria ({track_bitrate} kbps < {threshold_bitrate} kbps)")
-            return cls._execute_preference_action(track, action_mode, db_manager, "Low_Quality_Bitrate")
+            print(
+                f"   -> [Automation Triggered] '{track.get('FileName')}' failed Bitrate criteria ({track_bitrate} kbps < {threshold_bitrate} kbps)")
+            return cls._execute_preference_action(track, action_mode, prefs, db_manager, "Low_Quality_Bitrate")
 
         # --- CRITERIA STEP 2: Spectrogram High-Frequency Density Scan ---
         spectrum_file = Path(track["SpectrumPath"])
@@ -339,21 +343,25 @@ class AutomatedActionHandler:
         # CASE A: Genuine high-quality track crossing the visual line for more than half the runtime
         if density_ratio >= 50.0:
             cls._move_file_to_destination(track["FilePath"], Config.GOOD_FOLDER)
-            print(f"   -> [Action Log] Auto-Approved! High quality confirmed ({density_ratio:.2f}%). Moved to Good folder.")
+            print(
+                f"   -> [Action Log] Auto-Approved! High quality confirmed ({density_ratio:.2f}%). Moved to Good folder.")
             return "OK"
 
         # CASE B: Completely dead zone above the 19kHz boundary (No high frequencies at all)
         elif density_ratio == 0.0:
-            print(f"   -> [Automation Triggered] '{track.get('FileName')}' failed Spectrogram criteria (0.0% energy above visual guide)")
-            return cls._execute_preference_action(track, action_mode, db_manager, "Dead_Spectrum")
+            print(
+                f"   -> [Automation Triggered] '{track.get('FileName')}' failed Spectrogram criteria (0.0% energy above visual guide)")
+            return cls._execute_preference_action(track, action_mode, prefs, db_manager, "Dead_Spectrum")
 
         # CASE C: Cautious Middle-Ground (Has high frequencies but less than half the runtime)
         else:
-            print(f"   -> [Action Log] Retained for Manual Review. Track has selective high-frequency presence ({density_ratio:.2f}%).")
+            print(
+                f"   -> [Action Log] Retained for Manual Review. Track has selective high-frequency presence ({density_ratio:.2f}%).")
             return None
 
     @classmethod
-    def _execute_preference_action(cls, track: dict, action_mode: str, db_manager: DatabaseManager, fallback_status: str) -> str | None:
+    def _execute_preference_action(cls, track: dict, action_mode: str, prefs: dict, db_manager: DatabaseManager,
+                                   fallback_status: str) -> str | None:
         """
         Executes specific file handling and tracking routines mapped out in application settings.
         """
@@ -362,8 +370,15 @@ class AutomatedActionHandler:
 
         if action_mode == "low_quality_wishlist":
             db_manager.insert_wishlist_track(track)
-            cls._move_file_to_destination(track["FilePath"], Config.LOW_QUALITY_FOLDER)
-            print(f"   -> [Action Log] Logged to Wishlist & moved to Low-Quality archive.")
+
+            # Resolve dynamic target directory path cleanly from custom string config or default
+            custom_folder_str = prefs.get("low_quality_folder", "output/low-quality")
+            custom_folder_path = Path(custom_folder_str)
+            if not custom_folder_path.is_absolute():
+                custom_folder_path = Config.PROJECT_ROOT / custom_folder_path
+
+            cls._move_file_to_destination(track["FilePath"], custom_folder_path)
+            print(f"   -> [Action Log] Logged to Wishlist & moved to Low-Quality archive ({custom_folder_path}).")
             return "Low_Quality"
 
         elif action_mode == "trash_wishlist":
@@ -474,11 +489,10 @@ class AudioProcessor:
 def main():
     """
     Main execution pipeline for the BatchQC audio analysis system.
-    Handles environmental checks, folder initialization, database cleanup,
-    metadata extraction, and rule-based automation routing.
+    Handles environmental checks, command-line arguments fallback vector overrides,
+    folder initialization, database cleanup, metadata extraction, and rule automation.
     """
     # --- CRITICAL: Environmental Dependency Verification ---
-    # Ensure FFmpeg is installed globally and accessible via the system PATH
     if not shutil.which("ffmpeg"):
         print("\n" + "!" * 80)
         print("[CRITICAL ERROR] FFmpeg was not found on your system!")
@@ -486,17 +500,44 @@ def main():
         print("Please install FFmpeg and append its 'bin' directory to your system's PATH.")
         print("Refer to the project's README.md for a detailed step-by-step setup guide.")
         print("!" * 80 + "\n")
-        return  # Gracefully abort execution to prevent downstream processing failures
+        return
+
+    # ==========================================================================
+    # --- COMMAND-LINE ARGUMENT INTERCEPTOR LAYER ---
+    # ==========================================================================
+    parser = argparse.ArgumentParser(description="BatchQC Automated Staging Audio Quality Analyzer Engine")
+    parser.add_argument("--bitrate", type=int, help="Override quality boundary threshold (kbps)")
+    parser.add_argument("--mode", type=str, choices=["none", "low_quality_wishlist", "trash_wishlist", "trash_only"],
+                        help="Override automated ingestion workflow routing target selection mode")
+    parser.add_argument("--folder", type=str, help="Override archive destination folder path for low quality assets")
+    args = parser.parse_args()
+
+    # Base setup initialization
+    prefs = PreferencesLoader.load()
+
+    # Apply argument modifications if passed via shell execution arguments explicitly
+    if args.bitrate is not None:
+        print(f"[CLI Override] Updating bitrate threshold: {args.bitrate} kbps")
+        prefs["bitrate_threshold"] = args.bitrate
+    if args.mode is not None:
+        print(f"[CLI Override] Updating auto action mode: {args.mode}")
+        prefs["auto_action_mode"] = args.mode
+    if args.folder is not None:
+        print(f"[CLI Override] Updating low-quality folder: {args.folder}")
+        prefs["low_quality_folder"] = args.folder
 
     # --- Directory Structure Initialization ---
-    # Automatically generate required system folders if they do not exist
     for folder in [Config.INPUT_FOLDER, Config.SPECTROGRAMS_FOLDER, Config.CORRUPTED_FOLDER,
-                   Config.TRASH_FOLDER, Config.LOW_QUALITY_FOLDER, Config.GOOD_FOLDER,
-                   Config.DATABASE_FOLDER]:
+                   Config.TRASH_FOLDER, Config.GOOD_FOLDER, Config.DATABASE_FOLDER]:
         folder.mkdir(parents=True, exist_ok=True)
 
-    # --- Configuration and Environment Setup ---
-    prefs = PreferencesLoader.load()
+    # Resolve dynamic target directory path cleanly to create low quality folder context if it doesn't exist
+    custom_folder_str = prefs.get("low_quality_folder", "output/low-quality")
+    custom_folder_path = Path(custom_folder_str)
+    if not custom_folder_path.is_absolute():
+        custom_folder_path = Config.PROJECT_ROOT / custom_folder_path
+    custom_folder_path.mkdir(parents=True, exist_ok=True)
+
     db = DatabaseManager(Config.DB_FILE)
 
     print(f"Launching BatchQC Pipeline. Logging to: {Config.DB_FILE.name}")
@@ -505,8 +546,6 @@ def main():
     # ==========================================================================
     # --- AUTOMATED SPECTROGRAM CLEANUP ENGINE ---
     # ==========================================================================
-    # Purge localized spectrogram cache files belonging to fully settled tracks
-    # (Processes both auto-sorted tracks and user-approved manual queue tracks)
     print("[Cleanup] Querying database for finalized track records...")
     cleanup_paths = db.get_cleanup_spectrogram_paths()
     deleted_images_counter = 0
@@ -528,38 +567,28 @@ def main():
     print("-" * 80)
     # ==========================================================================
 
-    # Cache historically registered files to guarantee idempotent batch execution
     already_processed = db.get_processed_file_paths()
-
-    # Discover target audio inventory matching specified extension rules
     audio_files = [f for f in Config.INPUT_FOLDER.rglob("*") if f.suffix.lower() in Config.SUPPORTED_EXTENSIONS]
     new_tracks_counter = 0
 
     # --- Main Input Inventory Traversal ---
     for audio_file in audio_files:
         file_path_str = str(audio_file.resolve())
+        file_size_bytes = audio_file.stat().st_size
 
-        # Bypass files that have already been audited and committed to the database
-        file_path_str = str(audio_file.resolve())
-        file_size_bytes = audio_file.stat().st_size  # Dynamically get current file size in bytes
-
-        # Check if this specific file version (Path + Size combination) was already processed
         if (file_path_str, file_size_bytes) in already_processed:
             continue
 
         print(f"\nProcessing: {audio_file.name}")
 
-        # Stream integrity check to eliminate broken or unreadable container files
         if AudioProcessor.check_is_corrupted(audio_file):
             print("   -> [WARNING] File payload corrupted! Isolating track to 'Corrupted' folder.")
             shutil.move(str(audio_file), str(Config.CORRUPTED_FOLDER / audio_file.name))
             continue
 
-        # Analytical transformations and metadata extraction routines
         spectrum_img = AudioProcessor.generate_spectrogram(audio_file)
         meta = AudioProcessor.extract_metadata(audio_file)
 
-        # Fallback Metadata Enrichment via remote Open-Source Web Registries (MusicBrainz)
         has_new_metadata_to_write = False
         if not meta["Genre"] and meta["Artist"] and meta["Title"]:
             fetched_genre = MusicBrainzService.fetch_genre(meta["Artist"], meta["Title"])
@@ -567,11 +596,9 @@ def main():
                 meta["Genre"] = fetched_genre
                 has_new_metadata_to_write = True
 
-        # Commit metadata mutations directly back into the native audio container tags
         if has_new_metadata_to_write:
             AudioProcessor.write_metadata_to_file(audio_file, meta["Genre"])
 
-        # Unified tracking dataset structure mapping
         track_data = {
             "FileName": audio_file.stem,
             "FilePath": file_path_str,
@@ -586,13 +613,9 @@ def main():
             "SpectrumPath": str(spectrum_img),
         }
 
-        # --- Automated Multi-Criteria Logic Evaluation ---
-        # Filters low bitrates first, analyzes canvas spectrum boundaries next,
-        # and routes compliant high-quality items directly to the good-quality pool.
         auto_status = AutomatedActionHandler.process_rules(track_data, prefs, db)
         track_data["Status"] = auto_status
 
-        # Permanent ledger entry serialization
         db.insert_qc_track(track_data)
         new_tracks_counter += 1
 

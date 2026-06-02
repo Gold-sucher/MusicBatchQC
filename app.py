@@ -354,26 +354,29 @@ class CurationStorageService:
 # ==============================================================================
 # 6. ASYNCHRONOUS ENGINE WORKERS (Decoupled Background Tasks)
 # ==============================================================================
-def run_analysis_worker():
-    """Runs the backend parsing script within a decoupled, non-blocking OS context."""
+def run_analysis_worker(bitrate_override=None, mode_override=None, folder_override=None):
+    """
+    Runs the backend parsing script within a decoupled, non-blocking OS context.
+    Passes custom runtime environment parameter overrides if specified by the interface.
+    """
     try:
-        subprocess.run(["python", str(WebConfig.ANALYZER_SCRIPT)], check=True)
+        # Construct scalable CLI argument list vector dynamically
+        cmd = ["python", str(WebConfig.ANALYZER_SCRIPT)]
+
+        if bitrate_override:
+            cmd.extend(["--bitrate", str(bitrate_override)])
+        if mode_override:
+            cmd.extend(["--mode", str(mode_override)])
+        if folder_override:
+            cmd.extend(["--folder", str(folder_override)])
+
+        print(f"[Flask-Core] Spawning analyzer background subprocess execution pipeline: {cmd}")
+        subprocess.run(cmd, check=True)
     except Exception as e:
         print(f"[Flask-Core] Background analysis script exception: {e}")
     finally:
         with WebConfig.analysis_lock:
             WebConfig.is_analysis_running = False
-
-
-def run_transform_worker():
-    """Runs the backend track formatting script within a decoupled, non-blocking OS context."""
-    try:
-        subprocess.run(["python", str(WebConfig.TRANSFORM_SCRIPT)], check=True)
-    except Exception as e:
-        print(f"[Flask-Core] Background transformation script exception: {e}")
-    finally:
-        with WebConfig.transform_lock:
-            WebConfig.is_transform_running = False
 
 
 # ==============================================================================
@@ -515,15 +518,33 @@ def undo():
 
 @app.route('/start-analysis', methods=['POST'])
 def start_analysis():
-    """Initializes the asynchronous audio analysis engine thread under safety locks."""
+    """
+    Initializes the asynchronous audio analysis engine thread under safety locks.
+    Captures flexible pipeline configurations directly from the confirmation modal payload.
+    """
     with WebConfig.analysis_lock:
         if WebConfig.is_analysis_running:
             return jsonify({"status": "error", "message": "Analysis backend worker thread locked."}), 429
 
+        # Capture granular runtime parameter overrides submitted via modal trigger form
+        bitrate_threshold = request.form.get('bitrate_threshold')
+        auto_action_mode = request.form.get('auto_action_mode')
+        low_quality_folder = request.form.get('low_quality_folder')
+
         WebConfig.is_analysis_running = True
-        worker = threading.Thread(target=run_analysis_worker)
+
+        # Instantiate background thread mapping targeted manual curation parameters
+        worker = threading.Thread(
+            target=run_analysis_worker,
+            kwargs={
+                "bitrate_override": bitrate_threshold,
+                "mode_override": auto_action_mode,
+                "folder_override": low_quality_folder
+            }
+        )
         worker.start()
 
+    flash("Audio analysis pipeline triggered successfully with customized rules.", "success")
     return redirect(url_for('index'))
 
 

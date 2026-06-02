@@ -367,8 +367,8 @@
       align-items: center;
       gap: 8px;
     }
-    .input-row input[type="number"] {
-      width: 100px;
+    .input-row input[type="number"], .input-row input[type="text"] {
+      width: 100%;
       padding: 8px 10px;
       border: 1px solid #ced4da;
       border-radius: 6px;
@@ -377,7 +377,7 @@
       outline: none;
       transition: border-color 0.15s;
     }
-    .input-row input[type="number"]:focus { border-color: #0d6efd; }
+    .input-row input[type="number"]:focus, .input-row input[type="text"]:focus { border-color: #0d6efd; }
     .input-unit { font-size: 0.85rem; color: #6c757d; }
 
     .select-dropdown {
@@ -402,6 +402,36 @@
   </style>
 </head>
 <body>
+
+  {% macro render_pipeline_settings(prefs_context, prefix='') %}
+    <div class="pref-field">
+      <label class="pref-label">Quality Baseline Bitrate</label>
+      <div class="pref-hint">Tracks falling below this boundary level will trigger targeted automation presets.</div>
+      <div class="input-row">
+        <input type="number" id="{{ prefix }}bitrate_threshold" name="bitrate_threshold" value="{{ prefs_context.bitrate_threshold }}" min="64" max="320" style="width: 100px;" required>
+        <span class="input-unit">kbps</span>
+      </div>
+    </div>
+
+    <div class="pref-field" style="margin-top: 16px;">
+      <label class="pref-label">Unified Action Target</label>
+      <div class="pref-hint">Select what happens automatically if a track has a low bitrate OR does not cross above the visual guide line (19kHz).</div>
+      <select id="{{ prefix }}auto_action_mode" name="auto_action_mode" class="select-dropdown">
+        <option value="none" {% if prefs_context.auto_action_mode == 'none' %}selected{% endif %}>Disabled (Manual Review Only)</option>
+        <option value="low_quality_wishlist" {% if prefs_context.auto_action_mode == 'low_quality_wishlist' %}selected{% endif %}>Move to Low-Quality & Add to Wishlist</option>
+        <option value="trash_wishlist" {% if prefs_context.auto_action_mode == 'trash_wishlist' %}selected{% endif %}>Move to Trash & Add to Wishlist</option>
+        <option value="trash_only" {% if prefs_context.auto_action_mode == 'trash_only' %}selected{% endif %}>Move to Trash Directly (No Wishlist)</option>
+      </select>
+    </div>
+
+    <div class="pref-field" style="margin-top: 16px;">
+      <label class="pref-label">Low-Quality Destination Folder</label>
+      <div class="pref-hint">Target directory path where the automated low-quality archive system pushes files.</div>
+      <div class="input-row">
+        <input type="text" id="{{ prefix }}low_quality_folder" name="low_quality_folder" value="{{ prefs_context.get('low_quality_folder', 'output/low-quality') }}" placeholder="e.g., output/low-quality" required>
+      </div>
+    </div>
+  {% endmacro %}
 
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
@@ -440,11 +470,9 @@
         </button>
       </form>
 
-      <form action="{{ url_for('start_analysis') }}" method="post" style="margin:0;">
-        <button type="submit" id="analysis-btn" class="btn btn-primary" {% if is_running %}disabled{% endif %}>
-          {% if is_running %}Analyzing Pipeline...{% else %}Launch Audio Analysis{% endif %}
-        </button>
-      </form>
+      <button type="button" id="analysis-btn" class="btn btn-primary" onclick="toggleAnalysisConfirmModal(true)" {% if is_running %}disabled{% endif %}>
+        {% if is_running %}Analyzing Pipeline...{% else %}🚀 Launch Audio Analysis{% endif %}
+      </button>
     </div>
   </div>
 
@@ -551,25 +579,7 @@
           <div class="pref-section">
             <div class="pref-section-title">Automated Ingestion Rules</div>
 
-            <div class="pref-field">
-              <label class="pref-label">Quality Baseline Bitrate</label>
-              <div class="pref-hint">Tracks falling below this boundary level will trigger targeted automation presets.</div>
-              <div class="input-row">
-                <input type="number" name="bitrate_threshold" value="{{ prefs.bitrate_threshold }}" min="64" max="320" required>
-                <span class="input-unit">kbps</span>
-              </div>
-            </div>
-
-            <div class="pref-field" style="margin-top: 16px;">
-              <label class="pref-label">Unified Action Target</label>
-              <div class="pref-hint">Select what happens automatically if a track has a low bitrate OR does not cross above the visual guide line (19kHz).</div>
-              <select name="auto_action_mode" class="select-dropdown">
-                <option value="none" {% if prefs.auto_action_mode == 'none' %}selected{% endif %}>Disabled (Manual Review Only)</option>
-                <option value="low_quality_wishlist" {% if prefs.auto_action_mode == 'low_quality_wishlist' %}selected{% endif %}>Move to Low-Quality & Add to Wishlist</option>
-                <option value="trash_wishlist" {% if prefs.auto_action_mode == 'trash_wishlist' %}selected{% endif %}>Move to Trash & Add to Wishlist</option>
-                <option value="trash_only" {% if prefs.auto_action_mode == 'trash_only' %}selected{% endif %}>Move to Trash Directly (No Wishlist)</option>
-              </select>
-            </div>
+            {{ render_pipeline_settings(prefs, prefix='pref_') }}
           </div>
 
           <div class="pref-section">
@@ -613,6 +623,33 @@
     </div>
   </div>
 
+  <div id="analysis-confirm-modal" class="modal-backdrop hidden">
+    <div class="modal-box">
+      <form action="{{ url_for('start_analysis') }}" method="post">
+
+        <div class="modal-header">
+          <h2>🚀 Configure Audio Analysis Run Parameters</h2>
+          <button type="button" class="modal-close" onclick="toggleAnalysisConfirmModal(false)">&times;</button>
+        </div>
+
+        <div class="modal-body">
+          <p style="font-size: 0.82rem; color: #6c757d; margin-top: 0; margin-bottom: 20px; line-height: 1.5;">
+            Review and adjust processing execution limits for this dynamic automated staging run cycle.
+            Inputs fallback cleanly to active workspace configuration criteria rules.
+          </p>
+
+          {{ render_pipeline_settings(prefs, prefix='launch_') }}
+        </div>
+
+        <div class="modal-footer" style="justify-content: flex-end; gap: 8px;">
+          <button type="button" class="btn btn-secondary" onclick="toggleAnalysisConfirmModal(false)">Cancel Execution</button>
+          <button type="submit" class="btn btn-primary">Fire Execution Target Pipeline</button>
+        </div>
+
+      </form>
+    </div>
+  </div>
+
   <script>
     // System active configuration cache vector injection mappings
     const hotkeys = {
@@ -647,10 +684,22 @@
     });
 
     /**
-     * Toggles visibility attributes of the modal configuration window card layer.
+     * Toggles visibility attributes of the modal preferences window card layer.
      */
     function togglePreferencesModal(shouldShow) {
       const modalNode = document.getElementById('preferences-modal');
+      if (shouldShow) {
+        modalNode.classList.remove('hidden');
+      } else {
+        modalNode.classList.add('hidden');
+      }
+    }
+
+    /**
+     * Toggles visibility attributes of the pipeline launch confirmation modal card layer.
+     */
+    function toggleAnalysisConfirmModal(shouldShow) {
+      const modalNode = document.getElementById('analysis-confirm-modal');
       if (shouldShow) {
         modalNode.classList.remove('hidden');
       } else {
@@ -667,8 +716,10 @@
         .then(data => {
           const btn = document.getElementById('analysis-btn');
           if (data.is_running) {
-            btn.disabled = true;
-            btn.innerText = "Analyzing Pipeline...";
+            if (btn.tagName === 'BUTTON') {
+              btn.disabled = true;
+              btn.innerText = "Analyzing Pipeline...";
+            }
             setTimeout(checkAnalysisStatus, 2000);
           } else {
             if (btn.disabled && btn.innerText === "Analyzing Pipeline...") {
