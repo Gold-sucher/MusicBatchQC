@@ -379,6 +379,27 @@ def run_analysis_worker(bitrate_override=None, mode_override=None, folder_overri
             WebConfig.is_analysis_running = False
 
 
+def run_transform_worker():
+    """
+    Runs the backend track transformation script within a decoupled, non-blocking OS context.
+    Natively maps to WebConfig.TRANSFORM_SCRIPT and cleans locks safely upon completion.
+    """
+    try:
+        # Construct scalable CLI argument list vector dynamically matching core design criteria
+        cmd = ["python", str(WebConfig.TRANSFORM_SCRIPT)]
+
+        print(f"[Flask-Core] Spawning transform background subprocess execution pipeline: {cmd}")
+
+        # Executes the external script and waits for it to complete
+        subprocess.run(cmd, check=True)
+
+    except Exception as e:
+        print(f"[Flask-Core] Background transformation script exception: {e}")
+    finally:
+        # Crucial safety mechanism: Release the lock completely so the button becomes active again
+        with WebConfig.transform_lock:
+            WebConfig.is_transform_running = False
+
 # ==============================================================================
 # 7. CONTROLLER ACTION ROUTINGS
 # ==============================================================================
